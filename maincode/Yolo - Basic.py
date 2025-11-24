@@ -53,7 +53,7 @@ def process_video(video_path, mask_path, video_label, result_text):
             fps = cap.get(cv2.CAP_PROP_FPS)
 
             model = YOLO("yolo11n.pt")
-            tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+            tracker = Sort(max_age=30, min_hits=1, iou_threshold=0.3)  # ✅ Giảm min_hits từ 3 -> 1
 
             # ✅ Đọc và resize mask một lần
             mask = cv2.imread(mask_path, 0)
@@ -69,11 +69,16 @@ def process_video(video_path, mask_path, video_label, result_text):
 
             vehicle_count = {"car": 0, "motorbike": 0, "bicycle": 0, "truck": 0}
             counted_ids = {k: set() for k in vehicle_count}
+            counted_at_line_1 = set()
+            counted_at_line_2 = set()
 
-            limits = [0, 500, 1200, 500]
-            limits_2 = [0, 550, 1200, 550]
+            # ✅ Điều chỉnh lines theo video của bạn (thường ở giữa frame)
+            # Format: [x1, y1, x2, y2]
+            limits = [0, int(frame_height * 0.5), frame_width, int(frame_height * 0.5)]  # Line 1 ở 50% height
+            limits_2 = [0, int(frame_height * 0.55), frame_width, int(frame_height * 0.55)]  # Line 2 ở 55% height
 
             frame_num = 0
+            debug_mode = True  # ✅ Bật debug để in chi tiết
 
             while True:
                 success, img = cap.read()
@@ -109,49 +114,76 @@ def process_video(video_path, mask_path, video_label, result_text):
                 # ✅ Update tracker với detections
                 track_results = tracker.update(detections)
 
-                # ✅ Xử lý tracked objects với smooth hóa
+                # ✅ Tạo mapping từ track_id -> class_name từ boxes_info
+                track_to_class = {}
+                for b in boxes_info:
+                    b_x1, b_y1, b_x2, b_y2, b_class = b
+                    b_cx = (b_x1 + b_x2) // 2
+                    b_cy = (b_y1 + b_y2) // 2
+                    
+                    # Tìm track nào match với detection này
+                    for track in track_results:
+                        t_x1, t_y1, t_x2, t_y2, t_id = map(int, track)
+                        t_cx = (t_x1 + t_x2) // 2
+                        t_cy = (t_y1 + t_y2) // 2
+                        
+                        # Match dựa trên IoU hoặc center distance
+                        if abs(b_cx - t_cx) < 100 and abs(b_cy - t_cy) < 100:
+                            track_to_class[int(t_id)] = b_class
+                            break
+
+                # ✅ Xử lý tracked objects
                 for track in track_results:
                     x1, y1, x2, y2, track_id = map(int, track)
                     track_id = int(track_id)
                     
-                    # Thêm vào smooth tracker
+                    # Thêm vào smooth tracker (chỉ cho visualization)
                     if track_id not in smooth_trackers:
                         smooth_trackers[track_id] = SmoothTracker(history_size=3)
                     
                     smooth_trackers[track_id].add_position(x1, y1, x2, y2)
                     
-                    # ✅ Lấy vị trí smooth
+                    # ✅ Lấy vị trí smooth cho vẽ hình
                     smooth_pos = smooth_trackers[track_id].get_smooth_position()
-                    if smooth_pos:
-                        x1, y1, x2, y2 = smooth_pos
+                    draw_x1, draw_y1, draw_x2, draw_y2 = smooth_pos if smooth_pos else (x1, y1, x2, y2)
                     
+                    # ✅ Dùng vị trí Kalman gốc cho đếm (không smooth)
                     cx = (x1 + x2) // 2
                     cy = (y1 + y2) // 2
+                    
+                    matched_class = track_to_class.get(track_id)
 
-                    # Tìm class của object
-                    matched_class = None
-                    for b in boxes_info:
-                        if abs(b[0] - x1) < 20 and abs(b[1] - y1) < 20:
-                            matched_class = b[4]
-                            break
-
-                    # Vẽ tracking info
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    # Vẽ tracking info (dùng smooth position)
+                    cv2.rectangle(img, (draw_x1, draw_y1), (draw_x2, draw_y2), (0, 255, 0), 2)
                     cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
-                    cv2.putText(img, f"ID {track_id}", (x1, y1 - 25),
+                    
+                    class_label = f"{matched_class}" if matched_class else "unknown"
+                    cv2.putText(img, f"ID {track_id} {class_label}", (draw_x1, draw_y1 - 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
-                    # Counting logic
+                    # ✅ Counting logic - chỉ khi có class
                     if matched_class:
-                        if limits[0] < cx < limits[2] and limits[1] - 8 < cy < limits[1] + 8:
-                            if track_id not in counted_ids[matched_class]:
-                                counted_ids[matched_class].add(track_id)
+                        # Debug: In vị trí để kiểm tra
+                        if debug_mode and frame_num % 10 == 0:  # In mỗi 10 frame
+                            print(f"Frame {frame_num}: ID {track_id} ({matched_class}), cx={cx}, cy={cy}")
+                            print(f"  Line 1 range: y={limits[1]-30}~{limits[1]+30}, x={limits[0]}~{limits[2]}")
+                        
+                        # Line 1: Từ trái sang phải (mở rộng tolerance)
+                        if limits[0] < cx < limits[2] and limits[1] - 30 < cy < limits[1] + 30:
+                            if track_id not in counted_at_line_1:
+                                counted_at_line_1.add(track_id)
                                 vehicle_count[matched_class] += 1
+                                print(f"✅ Đếm {matched_class} (ID {track_id}) tại line 1, cx={cx}, cy={cy}")
 
-                        if limits_2[0] < cx < limits_2[2] and limits_2[1] - 8 < cy < limits_2[1] + 8:
-                            if track_id not in counted_ids[matched_class]:
-                                counted_ids[matched_class].add(track_id)
+                        # Line 2: Từ trái sang phải (đặc biệt cho các lane khác)
+                        if limits_2[0] < cx < limits_2[2] and limits_2[1] - 30 < cy < limits_2[1] + 30:
+                            if track_id not in counted_at_line_2:
+                                counted_at_line_2.add(track_id)
                                 vehicle_count[matched_class] += 1
+                                print(f"✅ Đếm {matched_class} (ID {track_id}) tại line 2, cx={cx}, cy={cy}")
+                    else:
+                        if debug_mode and frame_num % 20 == 0:
+                            print(f"⚠️ Frame {frame_num}: Track {track_id} không match class nào, cx={cx}, cy={cy}")
 
                 # ✅ Xóa smooth trackers của các object đã mất
                 active_ids = set(int(t[4]) for t in track_results) if len(track_results) > 0 else set()
@@ -174,7 +206,7 @@ def process_video(video_path, mask_path, video_label, result_text):
                 video_label.config(image=imgtk)
 
                 video_label.update_idletasks()
-                time.sleep(0.01)
+                time.sleep(0.05)  # ✅ Tăng từ 0.01s -> 0.05s để giảm nháy
 
             cap.release()
             print("Released video capture")
